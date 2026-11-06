@@ -18,6 +18,7 @@ import {
 import { supabase } from "@/lib/supabase/client";
 
 type Message = {
+  id: number; // id DB (> 0) atau negatif untuk pesan/catatan lokal
   from: "user" | "bot";
   text: string;
   fileUrl?: string;
@@ -41,6 +42,11 @@ const CATEGORIES = [
 const MAX_FILE_MB = 5;
 const ACCEPTED = /^image\/(png|jpe?g|webp)$|^application\/pdf$/;
 const POLL_MS = 3000;
+const AI_WAIT_TIMEOUT_MS = 45000;
+const AI_WAIT_INTERVAL_MS = 2000;
+
+// Bersihkan artefak "=" dari insert n8n
+const cleanText = (s: string) => s.replace(/^=\s*/, "");
 
 export function ChatWidget() {
   const pathname = usePathname();
@@ -57,6 +63,8 @@ export function ChatWidget() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Snapshot id DB terakhir saat user mengirim — acuan mendeteksi balasan AI baru
+  const sendSnapshotRef = useRef(0);
 
   // Auto-scroll ke pesan terbaru
   useEffect(() => {
@@ -66,7 +74,7 @@ export function ChatWidget() {
     });
   }, [messages, open, stage]);
 
-  // Tutup panel chat dengan Escape
+  // Tutup dengan Escape
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
@@ -74,7 +82,7 @@ export function ChatWidget() {
     return () => document.removeEventListener("keydown", onKey);
   }, [open]);
 
-  // Sinkronisasi riwayat pesan dari database Supabase (chat_messages)
+  // Sinkronisasi: MERGE database + pesan lokal (catatan error tidak hilang diam-diam)
   const syncMessagesFromDb = useCallback(async () => {
     if (!sessionId) return;
 
@@ -84,17 +92,40 @@ export function ChatWidget() {
       .eq("session_id", sessionId)
       .order("id", { ascending: true });
 
-    if (error || !data || data.length === 0) return;
+    if (error) {
+      console.error("[widget] Gagal baca chat_messages:", error.message);
+      return;
+    }
+    if (!data || data.length === 0) return;
 
-    setMessages(
-      (data as ChatMessageRow[]).map((item) => ({
-        from: item.sender === "customer" ? ("user" as const) : ("bot" as const),
-        text: item.message,
-      }))
-    );
+    const rows = data as ChatMessageRow[];
+
+    const dbMessages: Message[] = rows.map((item) => ({
+      id: item.id,
+      from: item.sender === "customer" ? ("user" as const) : ("bot" as const),
+      text: cleanText(item.message),
+    }));
+
+    setMessages((prev) => {
+      const dbUserTexts = new Set(
+        dbMessages.filter((m) => m.from === "user").map((m) => m.text)
+      );
+      // Balasan AI baru masuk DB setelah send terakhir → catatan "menunggu" dibersihkan
+      const hasNewAi = rows.some(
+        (r) => r.sender === "ai" && r.id > sendSnapshotRef.current
+      );
+
+      const keepLocal = prev.filter((m) => {
+        if (m.id >= 0) return false; // baris DB menggantikan versi lokalnya
+        if (m.from === "user") return !dbUserTexts.has(m.text); // simpan sampai DB catch-up
+        return !hasNewAi; // catatan bot dipertahankan sampai balasan AI tiba
+      });
+
+      return [...dbMessages, ...keepLocal];
+    });
   }, [sessionId]);
 
-  // Realtime Supabase + Polling cadangan agar balasan CS/AI muncul seketika
+  // Realtime + polling cadangan
   useEffect(() => {
     if (!open || !sessionId || stage !== "chat") return;
 
@@ -131,14 +162,15 @@ export function ChatWidget() {
     setCategory(cat);
     setSessionId(newSessionId);
 
-    // Daftarkan sesi awal ke chat_handover dengan status 'ai'
-    await supabase.from("chat_handover").upsert(
+    const { error } = await supabase.from("chat_handover").upsert(
       { session_id: newSessionId, handled_by: "ai", updated_at: new Date().toISOString() },
       { onConflict: "session_id" }
     );
+    if (error) console.error("[widget] Gagal upsert chat_handover:", error.message);
 
     setMessages([
       {
+        id: -Date.now(),
         from: "bot",
         text: `Baik, kamu memilih "${cat}". Ceritakan kendala atau pertanyaanmu, ya.`,
       },
@@ -176,10 +208,18 @@ export function ChatWidget() {
     const objectUrl = file ? URL.createObjectURL(file) : undefined;
     const userMsgText = text || "(mengirim lampiran)";
 
-    // Tampilkan pesan pelanggan langsung di UI lokal
+    // id DB terakhir yang diketahui (abaikan pesan lokal ber-id negatif)
+    const lastDbId = messages.reduce(
+      (max, m) => (m.id > 0 ? Math.max(max, m.id) : max),
+      0
+    );
+    sendSnapshotRef.current = lastDbId;
+
+    // Bersihkan catatan error lama, tampilkan pesan user secara instan
     setMessages((prev) => [
-      ...prev,
+      ...prev.filter((m) => !(m.id < 0 && m.from === "bot")),
       {
+        id: -Date.now(),
         from: "user",
         text: userMsgText,
         fileUrl: objectUrl,
@@ -194,56 +234,126 @@ export function ChatWidget() {
 
     try {
       // 1. Simpan pesan pelanggan ke chat_messages
-      await supabase.from("chat_messages").insert({
+      const { error: msgError } = await supabase.from("chat_messages").insert({
         session_id: sessionId,
         sender: "customer",
         message: userMsgText,
       });
+      if (msgError) console.error("Gagal insert chat_messages:", msgError.message);
 
-      // 2. Simpan/update antrean di customer_chats agar muncul di dashboard CS
-      await supabase.from("customer_chats").insert({
-        session_id: sessionId,
-        customer_name: "Pelanggan Toko",
-        category: category ?? "Umum",
-        question: userMsgText,
-      });
+      // 2. Ambil nama user yang sedang login (misal zamkoi), atau fallback ke 'Pelanggan Toko'
+      const { data: authData } = await supabase.auth.getUser();
+      const currentUserName = authData?.user?.user_metadata?.full_name || 
+                              authData?.user?.email?.split("@")[0] || 
+                              "Pelanggan Toko";
 
-      // 3. Panggil Webhook n8n (n8n akan cek node 'Get Handover Status' -> jika 'ai', AI akan menjawab)
-      if (process.env.NEXT_PUBLIC_N8N_WEBHOOK_URL) {
-        let res: Response;
+      // 3. Simpan / perbarui antrean sesi di customer_chats
+      const { error: queueError } = await supabase.from("customer_chats").upsert(
+        {
+          session_id: sessionId,
+          customer_name: currentUserName,
+          category: category ?? "Umum",
+          question: userMsgText,
+          created_at: new Date().toISOString(),
+        },
+        { onConflict: "session_id" }
+      );
+      if (queueError) console.error("Gagal upsert customer_chats:", queueError.message);
 
-        if (sendingFile) {
-          const fd = new FormData();
-          fd.append("kategori", category ?? "");
-          fd.append("chat_input", text);
-          fd.append("session_id", sessionId);
-          fd.append("file", sendingFile);
-          res = await fetch(process.env.NEXT_PUBLIC_N8N_WEBHOOK_URL, {
-            method: "POST",
-            body: fd,
-          });
-        } else {
-          res = await fetch(process.env.NEXT_PUBLIC_N8N_WEBHOOK_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              kategori: category,
-              chat_input: text,
-              session_id: sessionId,
-            }),
-          });
+      // 3. Cek status pengelolaan sesi
+      const { data: handover } = await supabase
+        .from("chat_handover")
+        .select("handled_by")
+        .eq("session_id", sessionId)
+        .maybeSingle();
+
+      if (handover?.handled_by === "human") {
+        await syncMessagesFromDb();
+        return;
+      }
+
+      // 4. Panggil webhook AI
+      const webhook = process.env.NEXT_PUBLIC_N8N_WEBHOOK_URL;
+      if (!webhook) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: -(Date.now() + 1),
+            from: "bot",
+            text: "Webhook n8n belum diisi di .env.local marketplace.",
+          },
+        ]);
+        return;
+      }
+
+      let res: Response;
+      if (sendingFile) {
+        const fd = new FormData();
+        fd.append("kategori", category ?? "");
+        fd.append("chat_input", text);
+        fd.append("session_id", sessionId);
+        fd.append("file", sendingFile);
+        res = await fetch(webhook, { method: "POST", body: fd });
+      } else {
+        res = await fetch(webhook, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            kategori: category,
+            chat_input: text,
+            session_id: sessionId,
+          }),
+        });
+      }
+
+      if (!res.ok) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: -(Date.now() + 1),
+            from: "bot",
+            text: `Webhook n8n gagal: HTTP ${res.status}. Cek workflow aktif & Production URL.`,
+          },
+        ]);
+        return;
+      }
+
+      // 5. Tunggu balasan AI masuk ke database (n8n insert via node Insert AI Message)
+      const started = Date.now();
+      let gotReply = false;
+      while (Date.now() - started < AI_WAIT_TIMEOUT_MS) {
+        const { data: aiRows, error: aiErr } = await supabase
+          .from("chat_messages")
+          .select("id, sender")
+          .eq("session_id", sessionId)
+          .eq("sender", "ai")
+          .gt("id", sendSnapshotRef.current)
+          .limit(1);
+
+        if (!aiErr && aiRows && aiRows.length > 0) {
+          gotReply = true;
+          break;
         }
+        await new Promise((r) => setTimeout(r, AI_WAIT_INTERVAL_MS));
+      }
 
-        // Karena n8n memiliki node "Insert AI Message", balasan AI akan tersimpan di database
-        // dan otomatis ter-render lewat syncMessagesFromDb / Realtime.
-        if (res.ok) {
-          await syncMessagesFromDb();
-        }
+      if (gotReply) {
+        await syncMessagesFromDb(); // merge → catatan menunggu otomatis terhapus
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: -(Date.now() + 1),
+            from: "bot",
+            text: "AI belum membalas dalam 45 detik. Kemungkinan session_id di node 'Insert AI Message' tidak cocok, atau workflow gagal — cek Executions n8n.",
+          },
+        ]);
       }
     } catch (err) {
       setMessages((prev) => [
         ...prev,
         {
+          id: -(Date.now() + 1),
           from: "bot",
           text: `Gagal mengirim pesan: ${(err as Error).message}`,
         },
@@ -346,9 +456,9 @@ export function ChatWidget() {
                     <RotateCcw className="size-3" /> Percakapan baru
                   </button>
 
-                  {messages.map((m, i) => (
+                  {messages.map((m) => (
                     <div
-                      key={i}
+                      key={m.id}
                       className={`flex ${
                         m.from === "user" ? "justify-end" : "justify-start"
                       }`}
